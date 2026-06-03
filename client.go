@@ -27,7 +27,60 @@ type Client struct {
 	// when no explicit *http.Client is supplied. Storing it on the struct makes
 	// WithTimeout / WithHTTPClient order-independent.
 	timeout time.Duration
+
+	// checkRetry is the per-attempt retry decision. nil → DefaultCheckRetry
+	// over c.retry.RetryStatuses, installed lazily in New.
+	checkRetry CheckRetry
+	// honorRetryAfter, when true (the default), overrides the computed backoff
+	// with a server-supplied Retry-After delay on the failing attempt.
+	honorRetryAfter bool
+	// now is an injectable clock for Retry-After date math (tests). nil →
+	// time.Now.
+	now func() time.Time
+
+	// keyFunc, when non-nil, injects a stable Idempotency-Key header reused
+	// across retries of one logical request.
+	keyFunc KeyFunc
+	// allowNonIdempotentRetry permits retrying POST/PATCH even without an
+	// idempotency key. Independent of strictIdempotency.
+	allowNonIdempotentRetry bool
+	// strictIdempotency, when true, opts INTO the safety gate: non-idempotent
+	// verbs (POST/PATCH) are then retried only when made safe by an idempotency
+	// key or an explicit allowNonIdempotentRetry. It defaults to FALSE to
+	// preserve the library's historical behaviour (every method was retried),
+	// so the gate is additive and back-compatible.
+	strictIdempotency bool
+
+	// breaker is the opt-in circuit breaker. nil → no breaker.
+	breaker *CircuitBreaker
+	// budget is the opt-in retry budget (token bucket). nil → unlimited
+	// retries. Wire one via WithRetryBudget (todoku/budget sub-package).
+	budget RetryBudget
 }
+
+// RetryBudget is the storm-control admission gate consulted before each RETRY
+// (not the first attempt). It is an interface so the token-bucket implementation
+// can live in the todoku/budget sub-package behind the golang.org/x/time/rate
+// dependency (BOREALIS Law 6) without the core importing it. AllowRetry reports
+// whether a retry token is available; an exhausted budget stops the loop.
+type RetryBudget interface {
+	// AllowRetry reports whether the budget permits spending a token on a
+	// retry right now. It must be safe for concurrent use.
+	AllowRetry() bool
+}
+
+// ErrBudgetExhausted is returned when the configured [RetryBudget] denies a
+// retry token, so the [Client] stopped retrying to shed load (the AWS
+// Builders' Library "retry budget as primary storm-control" pattern). It
+// carries Retryable()=false.
+var ErrBudgetExhausted = &budgetExhaustedError{}
+
+type budgetExhaustedError struct{}
+
+func (*budgetExhaustedError) Error() string { return "todoku: retry budget exhausted" }
+
+// Retryable reports false — a budget rejection is the load-shedding decision.
+func (*budgetExhaustedError) Retryable() bool { return false }
 
 // Option configures a [Client] in the functional-options style. Pass any number
 // of options to [New]; later options win on conflict.
@@ -76,21 +129,118 @@ func WithUserAgent(ua string) Option {
 	return func(c *Client) { c.userAgent = ua }
 }
 
+// WithCheckRetry installs a custom [CheckRetry] policy, replacing the default
+// status-code decision. The hook runs per attempt and may convert any condition
+// into a hard stop by returning a non-nil error.
+func WithCheckRetry(cr CheckRetry) Option {
+	return func(c *Client) {
+		if cr != nil {
+			c.checkRetry = cr
+		}
+	}
+}
+
+// WithRetryAfter toggles honouring the server's Retry-After header (default on).
+// When enabled, a 429/503 (or any failing response) carrying Retry-After
+// overrides the computed exponential backoff for that wait.
+func WithRetryAfter(honor bool) Option {
+	return func(c *Client) { c.honorRetryAfter = honor }
+}
+
+// WithIdempotencyKeys injects a stable Idempotency-Key header (from keyFunc,
+// e.g. [DefaultKeyFunc]) reused across every retry of one logical request,
+// making retries of non-idempotent verbs (POST/PATCH) safe per the IETF
+// Idempotency-Key draft. Supplying a key func also implicitly permits retrying
+// those verbs.
+func WithIdempotencyKeys(keyFunc KeyFunc) Option {
+	return func(c *Client) {
+		if keyFunc != nil {
+			c.keyFunc = keyFunc
+		}
+	}
+}
+
+// WithAllowNonIdempotentRetry permits retrying non-idempotent verbs (POST/PATCH)
+// even without an idempotency key. Only meaningful together with
+// [WithStrictIdempotency]; with the default (non-strict) gate every method is
+// already retried.
+func WithAllowNonIdempotentRetry(allow bool) Option {
+	return func(c *Client) { c.allowNonIdempotentRetry = allow }
+}
+
+// WithStrictIdempotency opts into the idempotency safety gate: when enabled,
+// non-idempotent verbs (POST/PATCH) are retried only when an [WithIdempotencyKeys]
+// key makes them safe or [WithAllowNonIdempotentRetry] explicitly permits it.
+//
+// It is OFF by default to preserve the library's historical behaviour (all
+// methods retried); enable it for at-most-once semantics on un-deduped servers.
+func WithStrictIdempotency(strict bool) Option {
+	return func(c *Client) { c.strictIdempotency = strict }
+}
+
+// WithCircuitBreaker installs an opt-in [CircuitBreaker]. Off by default
+// (BOREALIS: the breaker is opt-in; the retry budget is the default
+// storm-control). A nil breaker is ignored.
+func WithCircuitBreaker(cb *CircuitBreaker) Option {
+	return func(c *Client) {
+		if cb != nil {
+			c.breaker = cb
+		}
+	}
+}
+
+// WithRetryBudget installs a [RetryBudget] storm-control gate consulted before
+// each retry. The token-bucket implementation lives in the todoku/budget
+// sub-package (gated behind golang.org/x/time/rate per Law 6). A nil budget is
+// ignored (unlimited retries).
+func WithRetryBudget(b RetryBudget) Option {
+	return func(c *Client) {
+		if b != nil {
+			c.budget = b
+		}
+	}
+}
+
+// WithTransport installs the supplied [http.RoundTripper] as the underlying
+// client's transport, composing storm-control transport tuning (per-host pool
+// caps, ResponseHeaderTimeout) into any client. It allocates a fresh
+// *http.Client if none was set, preserving any captured timeout. This is the
+// Law-2 composition seam: build a transport with [TunedTransport] (or the
+// todoku/h2 sub-package for h2 ping knobs) and drop it in here.
+func WithTransport(rt http.RoundTripper) Option {
+	return func(c *Client) {
+		if rt == nil {
+			return
+		}
+		if c.httpClient == nil {
+			c.httpClient = &http.Client{Timeout: c.timeout}
+		}
+		c.httpClient.Transport = rt
+	}
+}
+
 // New constructs a [Client] from the given options. It never fails: with no
 // options it returns a usable client with [NoAuth], [DefaultRetry], a 30s
 // timeout, and a default User-Agent.
 func New(opts ...Option) (*Client, error) {
 	c := &Client{
-		auth:      NoAuth(),
-		retry:     DefaultRetry(),
-		timeout:   30 * time.Second,
-		userAgent: fmt.Sprintf("pleme-io/todoku-go %s", Version),
+		auth:            NoAuth(),
+		retry:           DefaultRetry(),
+		timeout:         30 * time.Second,
+		userAgent:       fmt.Sprintf("pleme-io/todoku-go %s", Version),
+		honorRetryAfter: true,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	if c.httpClient == nil {
 		c.httpClient = &http.Client{Timeout: c.timeout}
+	}
+	if c.checkRetry == nil {
+		c.checkRetry = DefaultCheckRetry(c.retry.RetryStatuses)
+	}
+	if c.now == nil {
+		c.now = time.Now
 	}
 	return c, nil
 }
@@ -142,6 +292,14 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 		bodyBytes = b
 	}
 
+	// Resolve a stable idempotency key once, so every retry of this logical
+	// request carries the same Idempotency-Key header (Stripe / IETF semantics).
+	idemKey := ""
+	if c.keyFunc != nil {
+		idemKey = c.keyFunc(method, url)
+	}
+	retryAllowedForMethod := c.retryAllowedForMethod(method, idemKey)
+
 	attempt := func(ctx context.Context) (*http.Response, error) {
 		var reqBody io.Reader
 		if bodyBytes != nil {
@@ -156,16 +314,46 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
+		if idemKey != "" {
+			req.Header.Set("Idempotency-Key", idemKey)
+		}
 		c.auth.Apply(req)
 
+		// Circuit breaker (opt-in) gates the attempt itself: an open breaker
+		// rejects without dialing. ErrBreakerOpen carries Retryable()=false so
+		// the retry loop stops immediately.
+		var breakerDone func(bool)
+		if c.breaker != nil {
+			done, berr := c.breaker.Allow()
+			if berr != nil {
+				return nil, &NonRetryableError{Err: berr}
+			}
+			breakerDone = done
+		}
+
 		resp, err := c.httpClient.Do(req)
+
+		// Run the CheckRetry policy with the raw (resp, err) pair. A non-nil
+		// policy error is a hard stop.
+		retry, policyErr := c.checkRetry(ctx, resp, err)
+		// Report the outcome to the breaker: a retryable failure (transport
+		// error or retryable status) counts as a failure; success/permanent
+		// 4xx count as a success (the server is reachable and answering).
+		if breakerDone != nil {
+			breakerDone(!(retry && (err != nil || (resp != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300)))))
+		}
+		if policyErr != nil {
+			if resp != nil {
+				drainBody(resp)
+			}
+			return nil, &NonRetryableError{Err: policyErr}
+		}
+
 		if err != nil {
-			// Transport error. Context cancellation is permanent; everything
-			// else (DNS, connection reset, timeout) is transient.
-			if isContextErr(err) {
+			if !retry {
 				return nil, &NonRetryableError{Err: err}
 			}
-			return nil, err
+			return nil, err // transient transport error
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -173,19 +361,70 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 		}
 
 		// Non-2xx. Read + close the body so the connection can be reused, then
-		// classify by status code.
+		// classify per the CheckRetry decision.
 		bodyStr := drainBody(resp)
-		if c.retry.ShouldRetryStatus(resp.StatusCode) {
-			return nil, &statusError{status: resp.StatusCode, body: bodyStr}
+		if retry {
+			se := &statusError{status: resp.StatusCode, body: bodyStr}
+			if d, ok := RetryAfter(resp, c.now); ok {
+				se.retryAfter, se.retryAfterSet = d, true
+			}
+			return nil, se
 		}
 		return nil, &NonRetryableError{Err: &HTTPError{Status: resp.StatusCode, Body: bodyStr}}
 	}
 
-	resp, err := RetryWithBackoffClass(ctx, c.retry, clientRetryable, attempt)
+	resp, err := RetryWithBackoffClass(ctx, c.callRetryConfig(retryAllowedForMethod), clientRetryable, attempt)
 	if err != nil {
 		return nil, unwrapClientError(err)
 	}
 	return resp, nil
+}
+
+// retryAllowedForMethod reports whether retries are permitted for a request of
+// the given method with the resolved idempotency key. With the default
+// (non-strict) gate every method is retryable, preserving historical behaviour.
+// Under [WithStrictIdempotency], a non-idempotent verb is retryable only when a
+// key makes it safe or it is explicitly allowed.
+func (c *Client) retryAllowedForMethod(method, idemKey string) bool {
+	if !c.strictIdempotency {
+		return true
+	}
+	return IsIdempotentMethod(method) || idemKey != "" || c.allowNonIdempotentRetry
+}
+
+// callRetryConfig clones the client's retry config and installs the per-call
+// hooks: Retry-After delay override, the budget/breaker storm-control gate, and
+// the non-idempotent-method retry guard. The single backoff loop in
+// [RetryWithBackoff] still owns sleeping — these hooks only override the wait
+// duration and admit/deny retries.
+func (c *Client) callRetryConfig(retryAllowedForMethod bool) RetryConfig {
+	cfg := c.retry
+	// Non-idempotent verb with no key and no opt-in → run exactly once. The
+	// last attempt's error (HTTPError / transport error) surfaces normally.
+	if !retryAllowedForMethod {
+		cfg.MaxRetries = 0
+	}
+	cfg.DelayOverride = func(_ int, err error) (time.Duration, bool) {
+		if !c.honorRetryAfter {
+			return 0, false
+		}
+		var se *statusError
+		if errors.As(err, &se) && se.retryAfterSet {
+			return se.retryAfter, true
+		}
+		return 0, false
+	}
+	if c.budget != nil {
+		cfg.BeforeRetry = func(_ int, _ error) error {
+			// Retry budget storm-control: an exhausted budget stops the loop
+			// and surfaces ErrBudgetExhausted.
+			if !c.budget.AllowRetry() {
+				return ErrBudgetExhausted
+			}
+			return nil
+		}
+	}
+	return cfg
 }
 
 // clientRetryable is the retry classifier for [Client.Do]. Only the synthetic

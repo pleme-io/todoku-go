@@ -29,14 +29,42 @@ type RetryConfig struct {
 	MaxBackoff time.Duration
 	// Multiplier is the exponential growth factor between attempts.
 	Multiplier float64
-	// Jitter is the maximum random perturbation applied to each backoff, as a
-	// fraction of the computed delay in [0,1]. 0 disables jitter (deterministic
-	// backoff); 0.2 means each delay is scaled by a random factor in [0.8,1.2].
+	// Jitter is the LEGACY ±fraction knob, retained for back-compat: the
+	// maximum random perturbation applied to each backoff as a fraction of the
+	// computed delay in [0,1]. 0.2 means each delay is scaled by a random
+	// factor in [0.8,1.2]. New code should leave this zero and set [JitterMode]
+	// instead; this field is only consulted when JitterMode is the default
+	// [JitterFull] AND it is non-zero, so the typed enum always wins when set
+	// to a non-default value.
+	//
+	// Deprecated: prefer [RetryConfig.JitterMode]. Kept working for existing
+	// callers; see [RetryConfig.effectiveJitter].
 	Jitter float64
+	// JitterMode is the typed jitter strategy (the preferred knob). The zero
+	// value is [JitterFull], the AWS-recommended default.
+	JitterMode Jitter
+	// Rand is an optional deterministic randomness source for jitter, primarily
+	// for tests. A nil Rand uses the package-global math/rand/v2 generator.
+	Rand RandSource
 	// RetryStatuses is the set of HTTP status codes the [Client] treats as
 	// retryable. It has no effect on bare [RetryWithBackoff] calls, which
 	// classify retryability via the operation's returned error instead.
 	RetryStatuses []int
+
+	// DelayOverride, when non-nil, lets a caller replace the computed
+	// (jittered) backoff for the wait after a failed attempt — returning
+	// (d, true) uses d verbatim (still respecting MaxBackoff), (_, false)
+	// keeps the exponential backoff. The [Client] uses it to honour
+	// Retry-After. It does NOT introduce a second backoff implementation: the
+	// single loop in [RetryWithBackoff] still owns sleeping and cancellation.
+	DelayOverride func(attempt int, err error) (time.Duration, bool)
+
+	// BeforeRetry, when non-nil, is consulted before each retry is admitted
+	// (after the decision to retry, before the backoff sleep). Returning a
+	// non-nil error stops the loop immediately and surfaces that error — the
+	// [Client] uses it to gate retries through the retry budget and circuit
+	// breaker (BOREALIS storm controls).
+	BeforeRetry func(attempt int, err error) error
 }
 
 // DefaultRetry returns the standard fleet retry configuration: 3 retries,
@@ -108,14 +136,39 @@ func (c RetryConfig) ShouldRetryStatus(status int) bool {
 	return false
 }
 
-// jitter applies up to ±Jitter random perturbation (as a fraction) to a delay.
-// A non-positive Jitter returns the delay unchanged.
+// jitter applies the configured jitter strategy to a computed delay. When
+// [RetryConfig.JitterMode] is a non-default value ([JitterNone]/[JitterEqual])
+// it wins. Otherwise, for back-compat, a non-zero legacy [RetryConfig.Jitter]
+// applies the historical ±fraction band; if that too is zero the default
+// [JitterFull] strategy is used.
 func (c RetryConfig) jitter(d time.Duration) time.Duration {
-	if c.Jitter <= 0 || d <= 0 {
+	if d <= 0 {
 		return d
 	}
+	// A typed strategy was explicitly selected — it is the forward knob and
+	// always wins.
+	if c.JitterMode != jitterUnset {
+		return applyJitter(c.JitterMode, d, c.Rand)
+	}
+	// No typed strategy: honour the legacy ±fraction band when the caller set
+	// it (DefaultRetry uses 0.2). A zero band preserves the historical "0
+	// disables jitter" contract — deterministic backoff — so existing
+	// zero-value callers are byte-for-byte unaffected.
+	if c.Jitter > 0 {
+		return c.legacyBandJitter(d)
+	}
+	return d
+}
+
+// legacyBandJitter reproduces the historical ±Jitter fraction band so existing
+// callers that set [RetryConfig.Jitter] keep their exact prior behaviour.
+func (c RetryConfig) legacyBandJitter(d time.Duration) time.Duration {
+	f := rand.Float64
+	if c.Rand != nil {
+		f = c.Rand.Float64
+	}
 	// factor in [1-Jitter, 1+Jitter].
-	factor := 1 + c.Jitter*(2*rand.Float64()-1)
+	factor := 1 + c.Jitter*(2*f()-1)
 	out := time.Duration(float64(d) * factor)
 	if out < 0 {
 		return 0
@@ -202,8 +255,16 @@ func retryWithClassifier[T any](ctx context.Context, cfg RetryConfig, retryable 
 			return value, nil
 		}
 
-		// Permanent error → stop now.
-		if retryable != nil && !retryable(err) {
+		// Law-5 carrier wins over the heuristic: an error that classifies
+		// itself (Retryable()/Temporary()) is authoritative even when no
+		// classifier was supplied.
+		if decision, ok := retryableViaCarrier(err); ok {
+			if !decision {
+				return zero, &NonRetryableError{Err: err}
+			}
+			// carrier says transient → fall through to the retry path.
+		} else if retryable != nil && !retryable(err) {
+			// No carrier; defer to the explicit classifier.
 			return zero, &NonRetryableError{Err: err}
 		}
 
@@ -212,8 +273,31 @@ func retryWithClassifier[T any](ctx context.Context, cfg RetryConfig, retryable 
 			return zero, &ExhaustedError{Attempts: attempt + 1, Err: err}
 		}
 
+		// Storm-control gate (budget / breaker): a non-nil error stops here.
+		if cfg.BeforeRetry != nil {
+			if stop := cfg.BeforeRetry(attempt, err); stop != nil {
+				return zero, stop
+			}
+		}
+
+		// Compute the wait. A DelayOverride (e.g. server Retry-After) replaces
+		// the exponential backoff but is still clamped to MaxBackoff; otherwise
+		// the single backoff impl applies.
+		var delay time.Duration
+		if cfg.DelayOverride != nil {
+			if d, ok := cfg.DelayOverride(attempt, err); ok {
+				if cfg.MaxBackoff > 0 && d > cfg.MaxBackoff {
+					d = cfg.MaxBackoff
+				}
+				delay = d
+			} else {
+				delay = cfg.jitter(cfg.BackoffFor(attempt))
+			}
+		} else {
+			delay = cfg.jitter(cfg.BackoffFor(attempt))
+		}
+
 		// Sleep with backoff before the next attempt, respecting cancellation.
-		delay := cfg.jitter(cfg.BackoffFor(attempt))
 		if delay > 0 {
 			timer := time.NewTimer(delay)
 			select {
