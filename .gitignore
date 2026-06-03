@@ -1,0 +1,4 @@
+/result
+*.out
+go.work
+go.work.sum
