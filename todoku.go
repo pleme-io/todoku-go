@@ -43,7 +43,20 @@
 // Dependency-bearing features are quarantined in leaf sub-packages (Law 6): the
 // core todoku package is zero-dep and offline-buildable; todoku/budget carries
 // golang.org/x/time/rate and todoku/h2 carries golang.org/x/net/http2.
+//
+// # Reachability + dedup surface
+//
+// Two further additive, pure-stdlib surfaces (BOREALIS §2.6 / registry 4d):
+//
+//   - [Client.Probe] / package [Probe] — service-reachability autodetect over a
+//     candidate scheme × API-path-prefix grid ("/api/v2" vs "/v2"), returning a
+//     typed [Reachability] ready to feed [WithBaseURL]. Backend-agnostic.
+//   - [WithSingleFlight] + [WithResultCache] — transport [Middleware] (the
+//     func(http.RoundTripper) http.RoundTripper shape, Law 2) that collapse
+//     concurrent identical reads onto one round-trip and memoise 2xx reads for a
+//     TTL window — the request-deduplication / funnel pattern, generalised, so
+//     it composes with retry/breaker/budget and any *http.Client.
 package todoku
 
 // Version is the library version, surfaced in the default User-Agent header.
-const Version = "0.2.0"
+const Version = "0.3.0"
